@@ -1,0 +1,108 @@
+digraph JiraTicketLoop {
+    graph [
+        goal="Pull my Jira assignments, plan with approval, implement on a ticket branch, open a PR, agent-review until clean, then human-review and merge",
+        rankdir=TB,
+        model_stylesheet="
+            *         { model: claude-sonnet-4-5; reasoning_effort: medium; }
+            .planning { reasoning_effort: high; }
+            .coding   { reasoning_effort: high; }
+            .review   { model: claude-opus-4-6; reasoning_effort: high; }
+        "
+    ]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    fetch_tickets [
+        label="Fetch Jira tickets",
+        class="planning",
+        prompt="Fetch open Jira issues currently assigned to the authenticated user.\n\nPrefer the `jira` CLI if available. Otherwise use the Jira REST API with JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN / JIRA_TOKEN.\n\nJQL: if the run input jira_jql is non-empty, use it as-is:\n{{ inputs.jira_jql }}\nOtherwise default to unresolved issues assigned to the current user, ordered by priority then updated.\n\nWrite `tickets.md` with a numbered list: KEY | summary | status | priority | url.\nIf none are assigned, say so clearly in tickets.md.\nDo not pick a ticket yet."
+    ]
+
+    // Mixed gate: type a ticket key (freeform) or Skip/none to exit.
+    // Do not force question_type=freeform; that would hide the Skip choice.
+    pick_ticket [
+        shape=hexagon,
+        label="Which ticket?"
+    ]
+
+    plan [
+        label="Plan",
+        class="planning",
+        max_visits=5,
+        prompt="Read tickets.md and the human's selected ticket (human.gate.text / preferred_label).\n\nAnalyze the codebase for that ticket. Write a concrete implementation plan to `plan.md`:\n- ticket key + summary\n- acceptance criteria\n- files likely to change and why\n- step-by-step implementation order\n- test / verification plan\n- risks / open questions\n\nDo not implement yet."
+    ]
+
+    approve_plan [shape=hexagon, label="Approve plan?"]
+
+    // Fabro already isolates the run in a git worktree. This stage only
+    // creates the feature branch inside that worktree.
+    make_branch [
+        label="Create ticket branch",
+        shape=parallelogram,
+        script="set -euo pipefail\nKEY=$(rg -oN '^[A-Z][A-Z0-9]+-[0-9]+' plan.md | head -1 || true)\nif [ -z \"$KEY\" ]; then KEY=$(rg -oN '[A-Z][A-Z0-9]+-[0-9]+' tickets.md | head -1 || true); fi\nif [ -z \"$KEY\" ]; then echo 'ERROR: no ticket key found in plan.md/tickets.md' >&2; exit 1; fi\nBRANCH=\"ticket/${KEY}\"\ngit fetch origin 2>/dev/null || true\nBASE=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's|origin/||' || echo main)\ngit checkout -B \"$BRANCH\" \"origin/${BASE}\" 2>/dev/null || git checkout -B \"$BRANCH\"\necho \"branch=$BRANCH\"\ngit status -sb\ngit rev-parse --abbrev-ref HEAD"
+    ]
+
+    subgraph cluster_impl {
+        label = "Implement"
+        node [thread_id="impl", fidelity="full"]
+
+        implement [
+            label="Implement",
+            class="coding",
+            max_visits=6,
+            prompt="Read plan.md and implement every step for the selected ticket.\nStay on the current ticket branch. Prefer small, reviewable commits.\nRun the project's relevant tests/linters when practical.\nDo not open a PR yet. Summarize what changed."
+        ]
+    }
+
+    open_pr [
+        label="Open pull request",
+        class="coding",
+        prompt="Push the current ticket branch and open a GitHub pull request with `gh`.\n\nTitle: `<TICKET-KEY>: <short summary>`.\nBody must include: ticket link/key, what changed, how to test, and a checklist from plan.md acceptance criteria.\n\nIf a PR for this branch already exists, update it instead of opening a duplicate.\nWrite `pr.md` with: PR number, URL, branch, base."
+    ]
+
+    agent_review [
+        label="Agent review",
+        class="review",
+        max_visits=5,
+        goal_gate=true,
+        retry_target="implement",
+        prompt="Review the current PR / diff against plan.md and the ticket.\nCheck correctness, missing tests, security, and accidental scope creep.\n\nWrite findings to `review.md`.\n\nIf changes are required, list concrete fix tasks and end with a JSON object: {\"preferred_next_label\": \"Fix\"}.\nIf the PR is ready for a human, end with {\"preferred_next_label\": \"Approve\"}."
+    ]
+
+    human_review [
+        shape=hexagon,
+        label="Review PR and merge?"
+    ]
+
+    merge_pr [
+        label="Merge PR",
+        class="coding",
+        goal_gate=true,
+        retry_target="implement",
+        prompt="Read pr.md. Merge the pull request with `gh pr merge <number> --squash --delete-branch` (or the repo's preferred strategy if documented).\nConfirm merge succeeded and write `merged.md` with the merge commit URL / PR state.\nDo not merge if CI is clearly failing — report the blocker instead and fail this stage."
+    ]
+
+    more_tickets [shape=hexagon, label="Another assigned ticket?"]
+
+    start -> fetch_tickets -> pick_ticket
+    pick_ticket -> plan [freeform=true]
+    pick_ticket -> exit  [label="[S] Skip / none"]
+
+    plan -> approve_plan
+    approve_plan -> make_branch [label="[A] Approve"]
+    approve_plan -> plan        [label="[R] Revise"]
+
+    make_branch -> implement -> open_pr -> agent_review
+
+    agent_review -> implement    [label="Fix"]
+    agent_review -> human_review [label="Approve"]
+
+    human_review -> merge_pr  [label="[M] Merge"]
+    human_review -> implement [label="[F] Needs fixes"]
+    human_review -> exit      [label="[X] Abort"]
+
+    merge_pr -> more_tickets
+    more_tickets -> fetch_tickets [label="[Y] Yes"]
+    more_tickets -> exit          [label="[N] Done"]
+}
