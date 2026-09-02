@@ -1,0 +1,39 @@
+_version = 1
+
+[workflow]
+graph = "workflow.fabro"
+
+[run]
+goal = "Pull my Jira assignments, plan with approval, implement on a ticket branch, open a PR, agent-review until clean, then human-review and merge"
+
+# Optional JQL override. Empty uses the fetch stage default
+# (unresolved issues assigned to the authenticated user).
+#
+#     fabro run jira-ticket-loop -I jira_jql='assignee = currentUser() AND status != Done'
+[run.inputs]
+jira_jql = ""
+
+# The graph opens and merges PRs mid-flow with `gh`. This repo's
+# `.fabro/project.toml` enables Fabro's end-of-run PR by default; turn
+# that off so the two mechanisms do not race.
+[run.pull_request]
+enabled = false
+
+[run.integrations.github.permissions]
+contents = "write"       # push the ticket/<KEY> branch
+pull_requests = "write"  # gh pr create / update / merge
+
+# Jira credentials are read from the sandbox environment (jira CLI or REST).
+# Store them in the vault, then map them into the run environment:
+#
+#     fabro secret set JIRA_BASE_URL https://your-org.atlassian.net
+#     fabro secret set JIRA_EMAIL you@example.com
+#     fabro secret set JIRA_API_TOKEN <api-token>
+#
+# [environments.fabro-dev.env]
+# JIRA_BASE_URL = "{{ secrets.JIRA_BASE_URL }}"
+# JIRA_EMAIL = "{{ secrets.JIRA_EMAIL }}"
+# JIRA_API_TOKEN = "{{ secrets.JIRA_API_TOKEN }}"
+# JIRA_TOKEN = "{{ secrets.JIRA_TOKEN }}"
+#
+# For local runs you can export the same variables in the shell instead.
